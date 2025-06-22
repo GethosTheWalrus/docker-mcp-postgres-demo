@@ -1,81 +1,307 @@
 import os
 import asyncio
 import time
+import traceback
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+import json
 
 from chat import get_chat_model
 from mcp_tools import initialize_mcp, get_available_tools, execute_mcp_tool, cleanup_mcp
 
-from langchain.agents import create_structured_chat_agent, AgentExecutor
-from langchain.prompts import PromptTemplate
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import StructuredTool
+from langchain_core.runnables import RunnableConfig
+from typing import Dict, Any, List
 
 # ANSI color codes
 CYAN = '\033[96m'
+GREEN = '\033[92m'
+YELLOW = '\033[93m'
+RED = '\033[91m'
 RESET = '\033[0m'
 
 def print_greeting():
     """Print the greeting message in a box."""
     print("╭──────────────────────────────────────────────────────────────────────────────╮")
-    print("│                                 MCP Chatbot                                  │")
-    print("╰────────────────────────── Powered by Docker and Ollama ──────────────────────╯")
+    print("│                            MCP Agent Chatbot                                │")
+    print("╰────────────── Powered by LangChain Agents, Docker and Ollama ──────────────╯")
 
 def print_thinking():
     """Print a loading indicator with spinning animation."""
-    print(f"{CYAN}AI >{RESET} Thinking", end="", flush=True)
+    print(f"{CYAN}Agent >{RESET} Thinking", end="", flush=True)
     for _ in range(3):
         time.sleep(0.3)
         print(".", end="", flush=True)
-    print(" ", end="", flush=True)
+    print(" ")
 
 def print_help():
     """Print available commands."""
     print("\nAvailable commands:")
     print("  /tools          - List available MCP tools")
-    print("  /mcp <server>   - List tools for a specific server")
-    print("  /call <server> <tool> [args] - Call a specific tool")
+    print("  /memory         - Show conversation memory")
+    print("  /new            - Start a new conversation (clear memory)")
     print("  /help           - Show this help message")
     print("  exit            - Exit the chatbot")
 
+class MCPToolWrapper:
+    """Wrapper to convert MCP tools to LangChain tools"""
+    
+    def __init__(self, mcp_manager):
+        self.mcp_manager = mcp_manager
+        self.tools_cache = None
+    
+    async def get_langchain_tools(self):
+        """Convert MCP tools to LangChain tools"""
+        if self.tools_cache is not None:
+            return self.tools_cache
+            
+        mcp_tools = await self.mcp_manager.client.get_tools()
+        langchain_tools = []
+        
+        for mcp_tool in mcp_tools:
+            # Create a LangChain tool for each MCP tool
+            langchain_tool = self._create_langchain_tool(mcp_tool)
+            langchain_tools.append(langchain_tool)
+        
+        self.tools_cache = langchain_tools
+        return langchain_tools
+    
+    def _create_langchain_tool(self, mcp_tool):
+        """Create a LangChain tool from an MCP tool"""
+        
+        # Get the server name for the tool (if available)
+        server_name = getattr(mcp_tool, 'server', None)
+        
+        # If server name is not available, and we only have one server, use that
+        if not server_name and len(self.mcp_manager.config["mcpServers"]) == 1:
+            server_name = list(self.mcp_manager.config["mcpServers"].keys())[0]
+            print(f"DEBUG - Using single server: '{server_name}'")
+        
+        # Create a unique tool name
+        tool_name = f"{server_name}_{mcp_tool.name}" if server_name else mcp_tool.name
+        
+        # Use the exact description from the MCP tool, with optional server description
+        description = mcp_tool.description
+        
+        # Add server description if available in config
+        if server_name and server_name in self.mcp_manager.config["mcpServers"]:
+            server_config = self.mcp_manager.config["mcpServers"][server_name]
+            if "description" in server_config:
+                description += f" ({server_config['description']})"
+                print(f"DEBUG - Enhanced description: {description}")
+        
+        # Get the input schema from the MCP tool
+        input_schema = getattr(mcp_tool, 'args_schema', None)
+        
+        # Debug: Print the actual schema
+        print(f"DEBUG - Tool: {tool_name}")
+        print(f"DEBUG - Description: {description}")
+        print(f"DEBUG - Input Schema: {input_schema}")
+        print(f"DEBUG - Schema Type: {type(input_schema)}")
+        print("---")
+        
+        async def dynamic_tool_func(**kwargs) -> str:
+            """Dynamically created function that calls the MCP tool"""
+            error_result = None
+            
+            try:
+                print(f"DEBUG - Tool called with kwargs: {kwargs}")
+                
+                # Use the MCP tool directly via ainvoke (the langchain-mcp-adapters way)
+                result = await mcp_tool.ainvoke(kwargs)
+                print(f"DEBUG - MCP tool returned: {result}")
+                
+                # Convert result to string for LangChain agent
+                if isinstance(result, dict):
+                    return json.dumps(result, indent=2)
+                elif isinstance(result, list):
+                    return json.dumps(result, indent=2)
+                else:
+                    return str(result)
+                    
+            except* Exception as e:
+                print(f"DEBUG - MCP tool error: {e}")
+                print(f"DEBUG - Exception type: {type(e)}")
+                
+                # Handle both single exceptions and exception groups
+                real_errors = []
+                if hasattr(e, 'exceptions') and e.exceptions:
+                    print(f"DEBUG - ExceptionGroup with {len(e.exceptions)} exceptions")
+                    for i, exc in enumerate(e.exceptions):
+                        print(f"DEBUG - Exception {i}: {type(exc).__name__}: {exc}")
+                        traceback.print_exception(type(exc), exc, exc.__traceback__)
+                        real_errors.append({
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__)
+                        })
+                else:
+                    # Single exception wrapped in except*
+                    print(f"DEBUG - Single exception: {type(e).__name__}: {e}")
+                    traceback.print_exception(type(e), e, e.__traceback__)
+                    real_errors.append({
+                        "type": type(e).__name__,
+                        "message": str(e),
+                        "traceback": traceback.format_exception(type(e), e, e.__traceback__)
+                    })
+                
+                # Build comprehensive error info for the agent
+                error_info = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "tool_name": tool_name,
+                    "attempted_args": kwargs,
+                    "expected_schema": input_schema,
+                    "underlying_errors": real_errors,
+                    "exception_count": len(real_errors)
+                }
+                
+                # Prioritize the first real error for the agent with actionable message
+                if real_errors:
+                    primary_error = real_errors[0]
+                    
+                    # Extract clean error message
+                    error_msg = primary_error['message']
+                    if ':' in error_msg and any(prefix in error_msg for prefix in ['McpError:', 'Error:', 'Exception:']):
+                        # Extract just the core error message after the error type
+                        clean_error = error_msg.split(':')[-1].strip()
+                        error_result = f"TOOL_ERROR: {clean_error}\n\nPlease analyze this error and try a different approach with corrected parameters."
+                    else:
+                        error_result = f"TOOL_ERROR: {error_msg}\n\nPlease analyze this error and try a different approach."
+                else:
+                    error_result = f"TOOL_ERROR: {json.dumps(error_info, indent=2)}"
+            
+            # Return error if we caught one
+            if error_result:
+                return error_result
+        
+        # Use the MCP schema directly if available
+        if input_schema and isinstance(input_schema, dict):
+            # Convert JSON Schema to Pydantic dynamically
+            from pydantic import create_model
+            
+            # Extract field definitions from JSON Schema
+            fields = {}
+            if 'properties' in input_schema:
+                for field_name, field_def in input_schema['properties'].items():
+                    field_type = str  # Default to string, could be enhanced to handle other types
+                    if field_def.get('type') == 'string':
+                        field_type = str
+                    elif field_def.get('type') == 'integer':
+                        field_type = int
+                    elif field_def.get('type') == 'boolean':
+                        field_type = bool
+                    
+                    # Add field with description if available
+                    fields[field_name] = (field_type, Field(description=field_def.get('description', f'{field_name} parameter')))
+            
+            # Create dynamic Pydantic model
+            DynamicInputModel = create_model(f'{tool_name}Input', **fields)
+            
+            # Create tool with dynamic schema
+            langchain_tool = StructuredTool.from_function(
+                func=dynamic_tool_func,
+                name=tool_name,
+                description=description,
+                args_schema=DynamicInputModel,
+                coroutine=dynamic_tool_func
+            )
+        else:
+            # No schema available, create basic tool
+            langchain_tool = StructuredTool.from_function(
+                func=dynamic_tool_func,
+                name=tool_name,
+                description=description,
+                coroutine=dynamic_tool_func
+            )
+        
+        return langchain_tool
+
 async def main():
     """
-    Main function for the MCP Chatbot.
+    Main function for the MCP Agent Chatbot.
     """
     load_dotenv()
     print_greeting()
     
+    # Initialize components
     try:
+        print("🔧 Initializing chat model...")
         chat_model = get_chat_model()
+        
         print("🔧 Initializing MCP servers...")
         mcp_manager = await initialize_mcp()
         print("✅ MCP initialization complete!")
-        # Get all MCP tools
-        tools = await mcp_manager.client.get_tools()
+        
+        # Wrap MCP tools for LangChain
+        print("🔧 Setting up agent tools...")
+        tool_wrapper = MCPToolWrapper(mcp_manager)
+        tools = await tool_wrapper.get_langchain_tools()
         print(f"📋 Found {len(tools)} MCP tools")
         
-        # Debug: Print tool details
+        # Print available tools
+        print("\n🛠️  Available tools:")
         for tool in tools:
-            print(f"🔧 Tool: {tool.name}")
-            print(f"   Description: {tool.description}")
-            print(f"   Args Schema: {getattr(tool, 'args_schema', 'No schema')}")
-            print(f"   Tool object: {type(tool)}")
-            print("---")
+            print(f"  - {GREEN}{tool.name}{RESET}: {tool.description}")
         
-        # Instead of using LangChain agents, let's create a simple custom implementation
-        # that directly handles tool calls to avoid JSON conversion issues
+        # Set up memory for conversation history
+        memory = MemorySaver()
         
-        print("🤖 Simple MCP chatbot ready! Type your question.")
-        print("Available tools:")
-        for tool in tools:
-            print(f"  - {tool.name}: {tool.description}")
+        # Create the ReAct agent with enhanced system prompt
+        print("🤖 Creating ReAct agent...")
+        
+        # Enhanced system prompt function for better reasoning and persistence
+        def create_system_prompt(state):
+            """Create a dynamic system prompt for the agent"""
+            system_content = """You are an intelligent assistant that can use various tools to help users. 
+
+Key principles:
+1. ALWAYS use tool results to answer questions - never make assumptions or provide generic responses
+2. When you get JSON results from tools, parse them and present the information in a user-friendly format
+3. When tools fail with errors, IMMEDIATELY try again with corrected parameters or approach
+4. Analyze error messages carefully to understand what went wrong and how to fix it
+5. Be VERY persistent - keep trying different approaches until you succeed
+6. Never give up after one failed attempt - always try at least 2-3 different approaches
+7. Always read tool descriptions carefully to understand what parameters they expect and what system you're working with
+8. Chain multiple tool calls together when needed to fully answer complex questions
+9. Think step by step and reason through problems systematically
+
+CRITICAL RULES:
+- After using a tool successfully, you MUST interpret and present the results to the user
+- When you see a TOOL_ERROR, immediately retry with corrected parameters based on the error message
+- Pay attention to the tool descriptions for context about what system/database/API you're working with
+- For complex tasks, break them down into multiple tool calls and chain them together
+- Keep trying until you get a successful result or exhaust reasonable options
+- Always provide a complete, helpful response based on the tool results"""
+            
+            from langchain_core.messages import SystemMessage
+            return [SystemMessage(content=system_content)] + state["messages"]
+
+        agent_executor = create_react_agent(
+            model=chat_model,
+            tools=tools,
+            checkpointer=memory,
+            prompt=create_system_prompt
+        )
+        
+        print("✅ Agent ready! The agent can now reason through problems and iterate when tools fail.")
         
     except Exception as e:
         print(f"❌ Error initializing: {e}")
         return
 
     print_help()
+    
+    # Conversation thread ID for memory
+    thread_id = "default_conversation"
+    config = {"configurable": {"thread_id": thread_id}}
 
     while True:
-        user_input = input(f"{CYAN}You >{RESET} ")
+        user_input = input(f"\n{CYAN}You >{RESET} ")
+        
         if user_input.lower() == 'exit':
             break
 
@@ -84,174 +310,55 @@ async def main():
             continue
             
         if user_input.startswith("/tools"):
-            try:
-                tools_dict = await get_available_tools()
-                if tools_dict:
-                    print("\n📋 Available MCP Tools:")
-                    for server, tool_list in tools_dict.items():
-                        print(f"\n  {server}:")
-                        for tool in tool_list:
-                            print(f"    - {tool}")
-                else:
-                    print("No MCP tools available.")
-            except Exception as e:
-                print(f"Error listing tools: {e}")
-            continue
-
-        if user_input.startswith("/mcp"):
-            parts = user_input.split()
-            if len(parts) == 2:
-                server_name = parts[1]
-                try:
-                    tools_dict = await get_available_tools()
-                    if server_name in tools_dict:
-                        print(f"\n📋 Tools for {server_name}:")
-                        for tool in tools_dict[server_name]:
-                            print(f"  - {tool}")
-                    else:
-                        print(f"Server '{server_name}' not found or has no tools.")
-                except Exception as e:
-                    print(f"Error: {e}")
-            else:
-                print("Usage: /mcp <server_name>")
-            continue
-
-        if user_input.startswith("/call"):
-            parts = user_input.split()
-            if len(parts) >= 3:
-                server_name = parts[1]
-                tool_name = parts[2]
-                try:
-                    result = await execute_mcp_tool(server_name, tool_name, {})
-                    print(f"\n🔧 Result from {server_name}.{tool_name}:")
-                    print(result)
-                except Exception as e:
-                    print(f"Error calling tool: {e}")
-            else:
-                print("Usage: /call <server_name> <tool_name>")
-            continue
-
-        # Handle regular chat with simple tool detection
-        print_thinking()
-        try:
-            # Build a description of available tools for the LLM
-            tools_description = "Available tools:\n"
+            print("\n📋 Available MCP Tools:")
             for tool in tools:
-                schema = getattr(tool, 'args_schema', {})
-                tools_description += f"- {tool.name}: {tool.description}\n"
-                tools_description += f"  Arguments schema: {schema}\n"
+                print(f"  - {GREEN}{tool.name}{RESET}: {tool.description}")
+            continue
             
-            # First, ask the LLM if it needs to use any tools and how
-            planning_prompt = f"""User question: {user_input}
-
-{tools_description}
-
-Based on the user's question, do you need to use any of the available tools to get information before answering? 
-
-If yes, respond with:
-TOOL_NEEDED: <tool_name>
-ARGUMENTS: <json_arguments>
-REASON: <why this tool is needed>
-
-If no tools are needed, respond with:
-NO_TOOLS_NEEDED
-
-Only suggest using a tool if it's clearly necessary to answer the user's question."""
-
-            planning_response = await chat_model.ainvoke(planning_prompt)
-            planning_text = planning_response.content.strip()
+        if user_input.startswith("/memory"):
+            print(f"\n🧠 Current conversation thread: {thread_id}")
+            print("Memory is preserved across messages in this session.")
+            continue
             
-            if planning_text.startswith("TOOL_NEEDED:"):
-                # Parse the LLM's tool request
-                lines = planning_text.split('\n')
-                tool_name = lines[0].replace("TOOL_NEEDED:", "").strip()
-                arguments_line = next((line for line in lines if line.startswith("ARGUMENTS:")), "")
-                reason_line = next((line for line in lines if line.startswith("REASON:")), "")
-                
-                if arguments_line:
-                    import json
-                    try:
-                        args_text = arguments_line.replace("ARGUMENTS:", "").strip()
-                        tool_args = json.loads(args_text)
-                        
-                        # Find and execute the requested tool
-                        target_tool = None
-                        for tool in tools:
-                            if tool.name == tool_name:
-                                target_tool = tool
-                                break
-                        
-                        if target_tool:
-                            print(f"\n🔧 TOOL CALL")
-                            print(f"Tool Name: {tool_name}")
-                            print(f"Tool Input: {tool_args}")
-                            print(f"Reason: {reason_line.replace('REASON:', '').strip()}")
-                            print("Executing...")
-                            
-                            # Execute the tool with proper async handling
-                            try:
-                                import concurrent.futures
-                                import asyncio
-                                
-                                # Create a new event loop in a thread pool to avoid conflicts
-                                def run_tool_in_new_loop():
-                                    new_loop = asyncio.new_event_loop()
-                                    asyncio.set_event_loop(new_loop)
-                                    try:
-                                        return new_loop.run_until_complete(target_tool.ainvoke(tool_args))
-                                    finally:
-                                        new_loop.close()
-                                
-                                # Run the tool in a separate thread
-                                with concurrent.futures.ThreadPoolExecutor() as executor:
-                                    future = executor.submit(run_tool_in_new_loop)
-                                    tool_result = future.result(timeout=30)  # 30 second timeout
-                                
-                                # Log the tool output
-                                print(f"\n📤 TOOL OUTPUT")
-                                print(f"Raw Result: {tool_result}")
-                                print("─" * 50)
-                                    
-                            except Exception as tool_error:
-                                print(f"❌ Tool execution error: {tool_error}")
-                                print("Let me try to answer without using tools.")
-                                response = await chat_model.ainvoke(user_input)
-                                print(response.content)
-                                continue
-                            
-                            # Now ask the LLM to provide the final answer using the tool result
-                            final_prompt = f"""User asked: {user_input}
+        if user_input.startswith("/new"):
+            # Generate new thread ID to start fresh conversation
+            import uuid
+            thread_id = str(uuid.uuid4())[:8]
+            config = {"configurable": {"thread_id": thread_id}}
+            print(f"🆕 Started new conversation (thread: {thread_id})")
+            continue
 
-I used the tool '{tool_name}' with arguments: {tool_args}
-
-The tool returned this result:
-{tool_result}
-
-Please provide a helpful, natural language response to the user's original question based on this information."""
-                            
-                            final_response = await chat_model.ainvoke(final_prompt)
-                            print(f"\n{final_response.content}")
-                        else:
-                            print(f"❌ Tool '{tool_name}' not found")
-                    except json.JSONDecodeError as e:
-                        print(f"❌ Error parsing tool arguments: {e}")
-                        print("Let me try to answer without using tools.")
-                        response = await chat_model.ainvoke(user_input)
-                        print(response.content)
+        # Handle regular chat with agent
+        print_thinking()
+        
+        try:
+            # Use the agent with proper ReAct flow - let it run until completion
+            print(f"\n{GREEN}Agent >{RESET} ")
+            
+            # The agent should handle the full conversation flow
+            result = await agent_executor.ainvoke(
+                {"messages": [HumanMessage(content=user_input)]}, 
+                config=config
+            )
+            
+            # Extract and display the final response
+            if "messages" in result and result["messages"]:
+                final_message = result["messages"][-1]
+                if hasattr(final_message, 'content') and final_message.content:
+                    print(final_message.content)
                 else:
-                    print("❌ No arguments provided for tool")
+                    print("Agent completed but provided no final response.")
             else:
-                # No tools needed, just use the LLM directly
-                response = await chat_model.ainvoke(user_input)
-                print(response.content)
+                print("No response from agent.")
                 
         except Exception as e:
-            print(f"\nAn error occurred: {e}")
+            print(f"\n{RED}❌ Error during conversation: {e}{RESET}")
+            print("The agent encountered an error. Please try rephrasing your question.")
 
     # Cleanup
-    print("\n🧹 Cleaning up...")
+    print(f"\n{CYAN}🧹 Cleaning up...{RESET}")
     await cleanup_mcp()
-    print("Goodbye!")
+    print("👋 Goodbye!")
 
 
 if __name__ == "__main__":
