@@ -25,7 +25,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - OLLAMA_BASE_URL=http://192.168.69.35:11434
-      - OLLAMA_MODEL=llama3.2:latest
+      - OLLAMA_MODEL=qwen3:14b
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     network_mode: "host"

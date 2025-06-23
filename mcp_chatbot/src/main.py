@@ -14,6 +14,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from langchain_core.runnables import RunnableConfig
+from langchain_core.callbacks import BaseCallbackHandler
 from typing import Dict, Any, List
 
 # ANSI color codes
@@ -23,19 +24,62 @@ YELLOW = '\033[93m'
 RED = '\033[91m'
 RESET = '\033[0m'
 
+class ToolSummaryCallbackHandler(BaseCallbackHandler):
+    """Simple callback handler to show tool usage summary"""
+    
+    def __init__(self):
+        self.tools_used = []
+    
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs: Any) -> None:
+        """Called when a tool starts"""
+        tool_name = serialized.get("name", "Unknown Tool")
+        self.tools_used.append({
+            "name": tool_name,
+            "input": input_str
+        })
+        print(f"\r{CYAN}🔧 Using tool: {tool_name}{RESET}")
+        if input_str:
+            print(f"{CYAN}   Input: {input_str}{RESET}")
+    
+    def on_tool_end(self, output: str, **kwargs: Any) -> None:
+        """Called when a tool ends"""
+        print(f"{GREEN}✅ Tool Result Success{RESET}")
+        print()  # Add space after tool result
+
 def print_greeting():
     """Print the greeting message in a box."""
     print("╭──────────────────────────────────────────────────────────────────────────────╮")
     print("│                            MCP Agent Chatbot                                │")
     print("╰────────────── Powered by LangChain Agents, Docker and Ollama ──────────────╯")
 
-def print_thinking():
-    """Print a loading indicator with spinning animation."""
-    print(f"{CYAN}Agent >{RESET} Thinking", end="", flush=True)
-    for _ in range(3):
-        time.sleep(0.3)
-        print(".", end="", flush=True)
-    print(" ")
+def print_thinking_spinner():
+    """Print a spinning loading indicator."""
+    spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    print(f"{CYAN}Agent >{RESET} ", end="", flush=True)
+    
+    import threading
+    import time
+    
+    class SpinnerControl:
+        def __init__(self):
+            self.spinning = True
+            
+        def stop(self):
+            self.spinning = False
+    
+    control = SpinnerControl()
+    
+    def spin():
+        idx = 0
+        while control.spinning:
+            print(f"\rAgent > {spinner_chars[idx % len(spinner_chars)]} Thinking...", end="", flush=True)
+            idx += 1
+            time.sleep(0.1)
+    
+    spinner_thread = threading.Thread(target=spin)
+    spinner_thread.daemon = True
+    spinner_thread.start()
+    return control, spinner_thread
 
 def print_help():
     """Print available commands."""
@@ -329,31 +373,53 @@ CRITICAL RULES:
             continue
 
         # Handle regular chat with agent
-        print_thinking()
-        
         try:
-            # Use the agent with proper ReAct flow - let it run until completion
-            print(f"\n{GREEN}Agent >{RESET} ")
+            # Start the spinner
+            spinner_control, spinner_thread = print_thinking_spinner()
             
-            # The agent should handle the full conversation flow
+            # Create callback handler for tool summary
+            callback_handler = ToolSummaryCallbackHandler()
+            
+            # Add callback to config
+            tool_config = {
+                **config,
+                "callbacks": [callback_handler]
+            }
+            
+            # Run the agent
             result = await agent_executor.ainvoke(
                 {"messages": [HumanMessage(content=user_input)]}, 
-                config=config
+                config=tool_config
             )
             
-            # Extract and display the final response
+            # Stop the spinner
+            spinner_control.stop()
+            spinner_thread.join(timeout=0.1)  # Give it a moment to stop gracefully
+            print("\r", end="")  # Clear the spinner line
+            
+            # Extract and show final response
             if "messages" in result and result["messages"]:
                 final_message = result["messages"][-1]
                 if hasattr(final_message, 'content') and final_message.content:
-                    print(final_message.content)
+                    response = final_message.content.strip()
+                    # Clean up response
+                    if response.startswith("Agent"):
+                        response = response.split(":", 1)[-1].strip() if ":" in response else response
+                    
+                    print(f"{GREEN}Agent >{RESET} {response}")
                 else:
-                    print("Agent completed but provided no final response.")
+                    print(f"{GREEN}Agent >{RESET} I completed the task but don't have a specific response to share.")
             else:
-                print("No response from agent.")
-                
+                print(f"{GREEN}Agent >{RESET} I wasn't able to generate a response. Please try rephrasing your question.")
+            
         except Exception as e:
-            print(f"\n{RED}❌ Error during conversation: {e}{RESET}")
-            print("The agent encountered an error. Please try rephrasing your question.")
+            # Stop the spinner if there's an error
+            if 'spinner_control' in locals() and 'spinner_thread' in locals():
+                spinner_control.stop()
+                spinner_thread.join(timeout=0.1)  # Give it a moment to stop gracefully
+                print("\r", end="")
+            print(f"{RED}❌ Error during conversation: {e}{RESET}")
+            print("I encountered an error. Please try rephrasing your question.")
 
     # Cleanup
     print(f"\n{CYAN}🧹 Cleaning up...{RESET}")
