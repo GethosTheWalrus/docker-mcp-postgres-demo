@@ -335,23 +335,36 @@ Key principles:
 8. Chain multiple tool calls together when needed to fully answer complex questions
 9. Think step by step and reason through problems systematically
 
-CRITICAL RULES:
+CRITICAL COMPLETION RULES:
+- When a user asks for information about "each" item, "all" items, or uses plural forms (like "tables", "files", "users"), you MUST continue until you've processed every single item
+- If you get a list of items from a tool call, immediately proceed to gather detailed information about each item in that list
+- NEVER stop after processing just one item when the user clearly wants information about multiple items
+- Continue making tool calls until you have covered every item the user requested
+- Only stop when you have completely fulfilled the user's request for ALL items
+
+FORMATTING AND RESPONSE RULES:
 - After using a tool successfully, you MUST interpret and present the results to the user
 - When you see a TOOL_ERROR, immediately retry with corrected parameters based on the error message
 - Pay attention to the tool descriptions for context about what system/database/API you're working with
 - For complex tasks, break them down into multiple tool calls and chain them together
 - Keep trying until you get a successful result or exhaust reasonable options
-- Always provide a complete, helpful response based on the tool results"""
+- Always provide a complete, helpful response based on the tool results
+- Format your answers as if they will appear in a terminal. You can create tables and lists using standard ASCII characters. You can color text using ANSI escape codes.
+- Do not ask for permission to continue with tasks the user has already requested - just do them"""
             
             from langchain_core.messages import SystemMessage
             return [SystemMessage(content=system_content)] + state["messages"]
 
+        # Create agent with proper configuration 
+        max_iterations = 100  # Increased for complex multi-step tasks
+        recursion_limit = 2 * max_iterations + 1  # LangGraph formula
+        
         agent_executor = create_react_agent(
             model=chat_model,
             tools=tools,
             checkpointer=memory,
             prompt=create_system_prompt
-        )
+        ).with_config(recursion_limit=recursion_limit)
         
         print("✅ Agent ready! The agent can now reason through problems and iterate when tools fail.")
         

@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:latest
-    container_name: mcp-postgres
+    container_name: postgres
     environment:
       POSTGRES_DB: sampledb
       POSTGRES_USER: mcp_user
@@ -25,7 +25,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=qwen3:14b
+      - OLLAMA_MODEL=llama3.2:latest
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
