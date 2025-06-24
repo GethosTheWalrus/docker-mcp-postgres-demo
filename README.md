@@ -4,9 +4,9 @@
 docker-compose up -d
 ```
 
-```mermaid
 Read more about integrating this database with a Dockerized MCP server on my website [here](https://miketoscano.com/blog/?post=docker-mcp-toolkit-postgres)
 
+```mermaid
 graph TB
     %% Core Components
     subgraph UserLayer["👥 User Interface Layer"]
