@@ -29,22 +29,60 @@ class ToolSummaryCallbackHandler(BaseCallbackHandler):
     
     def __init__(self):
         self.tools_used = []
+        self.tool_call_count = 0
+        self.last_shown_input = None
     
     def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs: Any) -> None:
         """Called when a tool starts"""
         tool_name = serialized.get("name", "Unknown Tool")
+        
+        # Only show if this is a new input (to avoid duplicate calls for same operation)
+        if input_str != self.last_shown_input:
+            # Clear the thinking spinner line completely first with more spaces
+            print("\r" + " " * 120, end="", flush=True)
+            print(f"\r{CYAN}🔧 Using tool: {tool_name.rstrip('.')}{RESET}")
+            if input_str:
+                print(f"{CYAN}   Input: {input_str}{RESET}")
+            print()  # Add space after tool call info
+            self.last_shown_input = input_str
+        
+        self.tool_call_count += 1
         self.tools_used.append({
             "name": tool_name,
             "input": input_str
         })
-        print(f"\r{CYAN}🔧 Using tool: {tool_name}{RESET}")
-        if input_str:
-            print(f"{CYAN}   Input: {input_str}{RESET}")
     
     def on_tool_end(self, output: str, **kwargs: Any) -> None:
         """Called when a tool ends"""
-        print(f"{GREEN}✅ Tool Result Success{RESET}")
-        print()  # Add space after tool result
+        self.tool_call_count -= 1
+        
+        # Only show result when all tool calls for this operation are done
+        if self.tool_call_count == 0:
+            # Clear any thinking spinner that might be running
+            print("\r" + " " * 80, end="", flush=True)  # Clear the line
+            print("\r", end="", flush=True)  # Move cursor to start
+            
+            # Check if any of the outputs indicate an error
+            # Convert output to string to handle different formats
+            output_str = str(output) if output else ""
+            
+            if output and ("TOOL_ERROR:" in output_str or "Tool Call Error" in output_str):
+                print()
+                print(f"{RED}❌ Tool Call Error{RESET}")
+            else:
+                print(f"{GREEN}✅ Tool Call Success{RESET}")
+            print()  # Add space after tool result
+            self.last_shown_input = None  # Reset for next operation
+    
+    def on_tool_error(self, error: Exception, **kwargs: Any) -> None:
+        """Called when a tool has an error"""
+        self.tool_call_count -= 1
+        
+        # Only show error when all tool calls for this operation are done
+        if self.tool_call_count == 0:
+            print(f"{RED}❌ Tool Call Error{RESET}")
+            print()  # Add space after tool result
+            self.last_shown_input = None  # Reset for next operation
 
 def print_greeting():
     """Print the greeting message in a box."""
@@ -55,7 +93,7 @@ def print_greeting():
 def print_thinking_spinner():
     """Print a spinning loading indicator."""
     spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    print(f"{CYAN}Agent >{RESET} ", end="", flush=True)
+    print(f"{YELLOW}Agent >{RESET} ", end="", flush=True)
     
     import threading
     import time
@@ -72,7 +110,7 @@ def print_thinking_spinner():
     def spin():
         idx = 0
         while control.spinning:
-            print(f"\rAgent > {spinner_chars[idx % len(spinner_chars)]} Thinking...", end="", flush=True)
+            print(f"\r{YELLOW}Agent > {spinner_chars[idx % len(spinner_chars)]} Thinking...{RESET}", end="", flush=True)
             idx += 1
             time.sleep(0.1)
     
@@ -105,7 +143,11 @@ class MCPToolWrapper:
         mcp_tools = await self.mcp_manager.client.get_tools()
         langchain_tools = []
         
+        print(f"Processing {len(mcp_tools)} MCP tools...")
         for mcp_tool in mcp_tools:
+            original_server = getattr(mcp_tool, 'server', 'None')
+            print(f"  Tool: '{mcp_tool.name}', original server: '{original_server}'")
+            
             # Create a LangChain tool for each MCP tool
             langchain_tool = self._create_langchain_tool(mcp_tool)
             langchain_tools.append(langchain_tool)
@@ -116,47 +158,33 @@ class MCPToolWrapper:
     def _create_langchain_tool(self, mcp_tool):
         """Create a LangChain tool from an MCP tool"""
         
-        # Get the server name for the tool (if available)
+        # Determine the correct server name - the MCP adapter doesn't set it properly
         server_name = getattr(mcp_tool, 'server', None)
+        if not server_name or server_name == 'unknown' or server_name == 'None':
+            # Since we only have one server configured, use that
+            if len(self.mcp_manager.config["mcpServers"]) == 1:
+                server_name = list(self.mcp_manager.config["mcpServers"].keys())[0]
         
-        # If server name is not available, and we only have one server, use that
-        if not server_name and len(self.mcp_manager.config["mcpServers"]) == 1:
-            server_name = list(self.mcp_manager.config["mcpServers"].keys())[0]
-            print(f"DEBUG - Using single server: '{server_name}'")
+        # Use the exact tool name without prefixing (the agent should use the clean name)
+        tool_name = mcp_tool.name
         
-        # Create a unique tool name
-        tool_name = f"{server_name}_{mcp_tool.name}" if server_name else mcp_tool.name
-        
-        # Use the exact description from the MCP tool, with optional server description
+        # Use the exact description from the MCP tool, with server description
         description = mcp_tool.description
-        
-        # Add server description if available in config
         if server_name and server_name in self.mcp_manager.config["mcpServers"]:
             server_config = self.mcp_manager.config["mcpServers"][server_name]
             if "description" in server_config:
                 description += f" ({server_config['description']})"
-                print(f"DEBUG - Enhanced description: {description}")
         
         # Get the input schema from the MCP tool
         input_schema = getattr(mcp_tool, 'args_schema', None)
-        
-        # Debug: Print the actual schema
-        print(f"DEBUG - Tool: {tool_name}")
-        print(f"DEBUG - Description: {description}")
-        print(f"DEBUG - Input Schema: {input_schema}")
-        print(f"DEBUG - Schema Type: {type(input_schema)}")
-        print("---")
         
         async def dynamic_tool_func(**kwargs) -> str:
             """Dynamically created function that calls the MCP tool"""
             error_result = None
             
             try:
-                print(f"DEBUG - Tool called with kwargs: {kwargs}")
-                
                 # Use the MCP tool directly via ainvoke (the langchain-mcp-adapters way)
                 result = await mcp_tool.ainvoke(kwargs)
-                print(f"DEBUG - MCP tool returned: {result}")
                 
                 # Convert result to string for LangChain agent
                 if isinstance(result, dict):
@@ -167,16 +195,10 @@ class MCPToolWrapper:
                     return str(result)
                     
             except* Exception as e:
-                print(f"DEBUG - MCP tool error: {e}")
-                print(f"DEBUG - Exception type: {type(e)}")
-                
                 # Handle both single exceptions and exception groups
                 real_errors = []
                 if hasattr(e, 'exceptions') and e.exceptions:
-                    print(f"DEBUG - ExceptionGroup with {len(e.exceptions)} exceptions")
                     for i, exc in enumerate(e.exceptions):
-                        print(f"DEBUG - Exception {i}: {type(exc).__name__}: {exc}")
-                        traceback.print_exception(type(exc), exc, exc.__traceback__)
                         real_errors.append({
                             "type": type(exc).__name__,
                             "message": str(exc),
@@ -184,8 +206,6 @@ class MCPToolWrapper:
                         })
                 else:
                     # Single exception wrapped in except*
-                    print(f"DEBUG - Single exception: {type(e).__name__}: {e}")
-                    traceback.print_exception(type(e), e, e.__traceback__)
                     real_errors.append({
                         "type": type(e).__name__,
                         "message": str(e),
@@ -279,6 +299,7 @@ async def main():
         print("🔧 Initializing MCP servers...")
         mcp_manager = await initialize_mcp()
         print("✅ MCP initialization complete!")
+        print()
         
         # Wrap MCP tools for LangChain
         print("🔧 Setting up agent tools...")
@@ -291,6 +312,7 @@ async def main():
         for tool in tools:
             print(f"  - {GREEN}{tool.name}{RESET}: {tool.description}")
         
+        print()
         # Set up memory for conversation history
         memory = MemorySaver()
         
@@ -337,7 +359,7 @@ CRITICAL RULES:
         print(f"❌ Error initializing: {e}")
         return
 
-    print_help()
+    # print_help()
     
     # Conversation thread ID for memory
     thread_id = "default_conversation"
@@ -350,21 +372,25 @@ CRITICAL RULES:
             break
 
         if user_input.startswith("/help"):
+            print()  # Blank line before command output
             print_help()
             continue
             
         if user_input.startswith("/tools"):
-            print("\n📋 Available MCP Tools:")
+            print()  # Blank line before command output
+            print("📋 Available MCP Tools:")
             for tool in tools:
                 print(f"  - {GREEN}{tool.name}{RESET}: {tool.description}")
             continue
             
         if user_input.startswith("/memory"):
-            print(f"\n🧠 Current conversation thread: {thread_id}")
+            print()  # Blank line before command output
+            print(f"🧠 Current conversation thread: {thread_id}")
             print("Memory is preserved across messages in this session.")
             continue
             
         if user_input.startswith("/new"):
+            print()  # Blank line before command output
             # Generate new thread ID to start fresh conversation
             import uuid
             thread_id = str(uuid.uuid4())[:8]
@@ -372,6 +398,9 @@ CRITICAL RULES:
             print(f"🆕 Started new conversation (thread: {thread_id})")
             continue
 
+        # Add blank line after user input before agent processing
+        print()
+        
         # Handle regular chat with agent
         try:
             # Start the spinner
@@ -395,7 +424,10 @@ CRITICAL RULES:
             # Stop the spinner
             spinner_control.stop()
             spinner_thread.join(timeout=0.1)  # Give it a moment to stop gracefully
-            print("\r", end="")  # Clear the spinner line
+            
+            # Clear the thinking line completely and start fresh
+            print("\r" + " " * 80, end="", flush=True)  # Overwrite with spaces
+            print("\r", end="", flush=True)  # Move cursor back to start
             
             # Extract and show final response
             if "messages" in result and result["messages"]:
@@ -406,11 +438,11 @@ CRITICAL RULES:
                     if response.startswith("Agent"):
                         response = response.split(":", 1)[-1].strip() if ":" in response else response
                     
-                    print(f"{GREEN}Agent >{RESET} {response}")
+                    print(f"{YELLOW}Agent >{RESET} {response}")
                 else:
-                    print(f"{GREEN}Agent >{RESET} I completed the task but don't have a specific response to share.")
+                    print(f"{YELLOW}Agent >{RESET} I completed the task but don't have a specific response to share.")
             else:
-                print(f"{GREEN}Agent >{RESET} I wasn't able to generate a response. Please try rephrasing your question.")
+                print(f"{YELLOW}Agent >{RESET} I wasn't able to generate a response. Please try rephrasing your question.")
             
         except Exception as e:
             # Stop the spinner if there's an error

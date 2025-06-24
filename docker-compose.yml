@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:15
+    image: postgres:latest
     container_name: mcp-postgres
     environment:
       POSTGRES_DB: sampledb
@@ -24,11 +24,12 @@ services:
       context: ./mcp_chatbot
       dockerfile: Dockerfile
     environment:
-      - OLLAMA_BASE_URL=http://192.168.69.35:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - OLLAMA_MODEL=qwen3:14b
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    network_mode: "host"
+    networks:
+      - mcp-network
     tty: true
     stdin_open: true
     restart: unless-stopped
