@@ -1,0 +1,17 @@
+{
+    "mcpServers": {
+      "postgres": {
+        "command": "docker",
+        "args": [
+          "run",
+          "-i",
+          "--rm",
+          "--network",
+          "host",
+          "mcp/postgres:latest",
+          "postgresql://mcp_user:mcp_password@127.0.0.1:5432/sampledb"
+        ],
+        "description": "PostgreSQL database"
+      }
+    }
+} 
