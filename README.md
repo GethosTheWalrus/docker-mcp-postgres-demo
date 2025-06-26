@@ -6,6 +6,8 @@ docker-compose up -d
 
 Read more about integrating this database with a Dockerized MCP server on my website [here](https://miketoscano.com/blog/?post=docker-mcp-toolkit-postgres)
 
+Learn how to utilize Docker's MCP Catalog to create custom agentic applications with LangChain and LangGraph [here](https://miketoscano.com/blog/?post=docker-mcp-langgraph-agent)
+
 ```mermaid
 %%{init: {
   "theme": "dark"
