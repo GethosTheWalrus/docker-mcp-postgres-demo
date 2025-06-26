@@ -24,7 +24,7 @@ services:
       context: ./mcp_chatbot
       dockerfile: Dockerfile
     environment:
-      - OLLAMA_BASE_URL=http://ollama.home:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - OLLAMA_MODEL=qwen3:14b
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
