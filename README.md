@@ -1,8 +1,15 @@
 ## Start Postgres
 
 ```bash
-docker-compose up -d
+docker compose up -d postgres
 ```
+
+## Start Chatbot
+```bash
+docker compose run --rm chatbot
+```
+
+## Blog Posts
 
 Read more about integrating this database with a Dockerized MCP server on my website [here](https://miketoscano.com/blog/?post=docker-mcp-toolkit-postgres)
 
